@@ -3,6 +3,8 @@ import os
 import tempfile
 import hashlib
 import re
+import ast
+import operator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -11,6 +13,7 @@ from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langchain.agents import create_agent
 from dotenv import load_dotenv
+
  
 load_dotenv()
  
@@ -48,36 +51,96 @@ def build_agent_for_file(file_hash: str, file_path: str):
     RELEVANCE_THRESHOLD = 1.15  # lower distance = more similar; tune based on testing
  
     def get_relevant_context(query: str):
-        """Returns (context_string, is_relevant: bool) using actual similarity scores."""
+        """Returns context, relevance status, and source page numbers."""
+
         results = vectorstore.similarity_search_with_score(query, k=3)
+
         if not results:
-            return "", False
- 
-        # Chroma returns (doc, distance) — LOWER distance means MORE similar
+            return "", False, []
+
+        # Lower distance means more similar
         best_distance = results[0][1]
         is_relevant = best_distance < RELEVANCE_THRESHOLD
- 
+
         context = ""
+        source_pages = []
+
         for doc, distance in results:
-            page = doc.metadata.get("page_label", "unknown")
+
+            # Extract page number from PDF metadata
+            page = doc.metadata.get("page_label")
+
+            if page is None:
+                page = doc.metadata.get("page")
+
+                if page is not None:
+                    page = int(page) + 1
+
+            if page is None:
+                page = "Unknown"
+
             context += f"[Page {page}]: {doc.page_content}\n\n"
-        return context, is_relevant
+
+            if page != "Unknown" and page not in source_pages:
+                source_pages.append(page)
+
+        return context, is_relevant, source_pages   
  
     @tool
     def search_document(query: str) -> str:
         """Search the uploaded document to answer questions about its content."""
-        context, is_relevant = get_relevant_context(query)
+        context, is_relevant, source_pages = get_relevant_context(query)
         if not is_relevant:
             return "No relevant information found in the document."
         return context
  
+    def safe_calculate(expression):
+        operations = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+        def evaluate(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return node.value
+
+            if isinstance(node, ast.BinOp) and type(node.op) in operations:
+                left = evaluate(node.left)
+                right = evaluate(node.right)
+
+                if isinstance(node.op, ast.Pow) and abs(right) > 100:
+                    raise ValueError("Exponent too large")
+
+                result = operations[type(node.op)](left, right)
+
+                if isinstance(result, (int, float)) and abs(result) > 1e100:
+                    raise ValueError("Result too large")
+
+                return result
+
+            if isinstance(node, ast.UnaryOp) and type(node.op) in operations:
+                return operations[type(node.op)](evaluate(node.operand))
+
+            raise ValueError("Invalid expression")
+
+        tree = ast.parse(expression, mode="eval")
+        return evaluate(tree.body)
+
+
     @tool
     def calculator(expression: str) -> str:
-        """Evaluate a simple math expression, e.g. '5 + 5' or '12 * 3'."""
+        """Safely evaluate basic mathematical expressions."""
         try:
-            return str(eval(expression))
-        except Exception as e:
-            return f"Error: {e}"
+            return str(safe_calculate(expression))
+        except Exception:
+            return "Invalid mathematical expression"
  
     system_prompt = """You are a document Q&A assistant. Answer questions using ONLY
     the retrieved context you're given. If the context doesn't contain the answer,
@@ -124,34 +187,116 @@ if "current_file_hash" not in st.session_state or st.session_state.current_file_
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+
+        # Restore citations from previous answers
+        if msg["role"] == "assistant" and msg.get("source_pages"):
+            with st.expander("📄 View Sources"):
+                st.write("Retrieved from PDF pages:")
+
+                for page in msg["source_pages"]:
+                    st.write(f"- Page {page}")
  
 user_input = st.chat_input("Ask a question about the document...")
  
+
+
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
+
     with st.chat_message("user"):
         st.markdown(user_input)
- 
+
+    # Initialize variables for every new question
+    source_pages = []
+    is_relevant = False
+    is_calculation = False
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            context, is_relevant = get_relevant_context(user_input)
- 
-            if not is_relevant:
-                answer = ("I don't know based on the provided document. "
-                          "This question doesn't appear to be covered in the uploaded PDF.")
-            else:
-                augmented_input = f"""Answer the user's question using ONLY the context below.
-If the context doesn't fully answer the question, say so.
- 
-Retrieved context from the document:
-{context}
- 
-User's question: {user_input}"""
- 
-                result = agent.invoke({"messages": augmented_input})
+
+            # 1. Detect calculation requests
+            has_calculation_keyword = (
+                re.search(
+                    r"\b(calculate|compute|solve)\b",
+                    user_input,
+                    re.IGNORECASE
+                )
+                and re.search(r"\d", user_input)
+            )
+
+            has_math_expression = re.search(
+                r"(?<![\w.])\d+(?:\.\d+)?\s*[+\-*/%]\s*\d+(?:\.\d+)?(?![\w.])",
+                user_input
+            )
+
+            is_calculation = bool(
+                has_calculation_keyword or has_math_expression
+            )
+
+            # 2. Calculation processing
+            if is_calculation:
+
+                result = agent.invoke({
+                    "messages": f"""
+                    The user is asking for a mathematical calculation.
+                    You MUST use the calculator tool to calculate the result.
+                    Do not search the uploaded document.
+
+                    User question: {user_input}
+                    """
+                })
+
                 raw_answer = result["messages"][-1].content
                 answer = re.sub(r'【.*?】', '', raw_answer).strip()
- 
+
+            # 3. Document question processing
+            else:
+
+                context, is_relevant, source_pages = (
+                    get_relevant_context(user_input)
+                )
+
+                if not is_relevant:
+                    answer = (
+                        "I don't know based on the provided document. "
+                        "This question doesn't appear to be covered "
+                        "in the uploaded PDF."
+                    )
+
+                else:
+                    augmented_input = f"""
+                    Answer the user's question using ONLY the context below.
+                    If the context doesn't fully answer the question, say so.
+
+                    Retrieved context from the document:
+                    {context}
+
+                    User's question: {user_input}
+                    """
+
+                    result = agent.invoke({
+                        "messages": augmented_input
+                    })
+
+                    raw_answer = result["messages"][-1].content
+                    answer = re.sub(
+                        r'【.*?】', '', raw_answer
+                    ).strip()
+
+        # 4. Display the answer
         st.markdown(answer)
- 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        # 5. Display source pages for document-based answers
+        if not is_calculation and is_relevant and source_pages:
+            with st.expander("📄 View Sources"):
+                st.write("Retrieved from PDF pages:")
+
+                for page in source_pages:
+                    st.write(f"- Page {page}")
+
+    # 6. Save assistant response for ALL types of questions
+    st.session_state.messages.append({
+    "role": "assistant",
+    "content": answer,
+    "source_pages": source_pages if is_relevant and not is_calculation else []
+})
